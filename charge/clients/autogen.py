@@ -17,6 +17,7 @@ try:
     from autogen_ext.tools.mcp import StdioServerParams, McpWorkbench, SseServerParams
     from autogen_agentchat.messages import TextMessage, StructuredMessage
     from autogen_agentchat.teams import RoundRobinGroupChat
+    from autogen_core.memory import MemoryContent, MemoryMimeType
 
 
 except ImportError:
@@ -28,8 +29,8 @@ import asyncio
 import re
 import os
 import warnings
-from charge.clients.AgentPool import AgentPool, Agent
-from charge.clients.Client import Client
+from charge.clients.agent_factory import AgentBackend, AgentFactory, Agent
+from charge.clients.client import Client
 from charge.clients.huggingface_client import HuggingFaceLocalClient
 from charge.clients.vllm_client import VLLMClient
 from charge.clients.autogen_utils import (
@@ -39,14 +40,14 @@ from charge.clients.autogen_utils import (
     generate_agent,
     CustomConsole,
     cli_chat_callback,
-    chargeConnectionError,
 )
 from charge.utils.mcp_workbench_utils import (
     _setup_mcp_workbenches,
     _close_mcp_workbenches,
 )
 from typing import Any, Tuple, Optional, Dict, Union, List, Callable, overload
-from charge.tasks.Task import Task
+from charge.experiments.memory import Memory
+from charge.tasks.task import Task
 from loguru import logger
 
 import logging
@@ -320,7 +321,7 @@ class AutoGenAgent(Agent):
 
     def __init__(
         self,
-        task: Task,
+        task: Optional[Task],
         model_client: Union[AsyncOpenAI, ChatCompletionClient],
         agent_name: str,
         model: str,
@@ -339,7 +340,9 @@ class AutoGenAgent(Agent):
         self.agent_name = agent_name
         self.model_client = model_client
         self.timeout = timeout
-        self.memory = self.setup_memory(memory)
+        self.memory: list[ChARGeListMemory] | ChARGeListMemory = self.setup_memory(
+            memory
+        )
         self.setup_kwargs = kwargs
 
         self.context_history = []
@@ -367,6 +370,7 @@ class AutoGenAgent(Agent):
         Returns:
             None
         """
+        assert self.task is not None
         self.workbenches = await _setup_mcp_workbenches(
             self.task.server_files, self.task.server_urls
         )
@@ -382,7 +386,7 @@ class AutoGenAgent(Agent):
         Returns:
             None
         """
-        _close_mcp_workbenches(self.workbenches)
+        await _close_mcp_workbenches(self.workbenches)
 
     def _create_agent(self, **kwargs) -> Any:
         """
@@ -391,6 +395,7 @@ class AutoGenAgent(Agent):
         Returns:
             Any: The created AutoGen agent.
         """
+        assert self.task is not None
         return generate_agent(
             self.model_client,
             self.model,
@@ -409,6 +414,7 @@ class AutoGenAgent(Agent):
         Returns:
             str: The prepared task prompt.
         """
+        assert self.task is not None
         user_prompt = self.task.get_user_prompt()
         if self.task.has_structured_output_schema():
             structured_out = self.task.get_structured_output_schema()
@@ -441,7 +447,9 @@ class AutoGenAgent(Agent):
             agent = self._create_structured_output_agent()
             prompt = (
                 "Convert the following output to the required structured format:\n\n"
-                f"{content}"
+                f"{content}\n\n"
+                "If the output is already correctly formatted, return the same output. "
+                "Never modify the reasoning_summary field."
             )
             result = await agent.run(task=prompt)
 
@@ -464,13 +472,14 @@ class AutoGenAgent(Agent):
     def _create_structured_output_agent(self) -> Any:
         """Creates an agent for structured output conversion."""
         if self._structured_output_agent is None:
+            assert self.task is not None
             self._structured_output_agent = generate_agent(
                 self.model_client,
                 f"{self.agent_name}_structured_output",
                 "You are an agent that converts model output to a structured format.",
                 [],  # No tools needed
                 max_tool_calls=1,
-                memory=self.memory,
+                # memory=self.memory,
                 output_content_type=self.task.get_structured_output_schema(),
             )
         return self._structured_output_agent
@@ -490,6 +499,7 @@ class AutoGenAgent(Agent):
             OutputValidationError: If all retries fail to produce valid output.
         """
         last_error = None
+        assert self.task is not None
 
         for attempt in range(1, self.max_retries + 1):
             try:
@@ -539,7 +549,7 @@ class AutoGenAgent(Agent):
             except POSSIBLE_CONNECTION_ERRORS as api_err:
                 error_msg = f"Attempt {attempt}: API connection error: {api_err}"
                 logger.error(error_msg)
-                raise chargeConnectionError(error_msg)
+                raise ConnectionError(error_msg)
             except Exception as e:
                 error_msg = f"Attempt {attempt}: Unexpected error: {e}"
                 logger.error(error_msg)
@@ -645,16 +655,16 @@ class AutoGenAgent(Agent):
         """
         self.context_history = history
 
-    def load_memory(self, jston_str: str) -> None:
+    def load_memory(self, json_str: str) -> None:
         """
         Loads memory content into the agent's memory.
         """
         if self.memory is not None:
             if isinstance(self.memory, list):
                 for mem in self.memory:
-                    mem.load_memory_content(jston_str)
+                    mem.load_memory_content(json_str)
             else:
-                self.memory.load_memory_content(jston_str)
+                self.memory.load_memory_content(json_str)
 
     def save_memory(self) -> str:
         """
@@ -679,10 +689,52 @@ class AutoGenAgent(Agent):
             "model_kwargs": self.model_kwargs,
         }
 
+    async def add_to_context(self, task: Task, result: Any):
+        # Implement adding the result to the context of the Autogen task
 
-class AutoGenPool(AgentPool):
+        # This is tricky and should be customized based on the use case
+        # We set the default behavior to add the instruction
+        #  result to the model context
+
+        instruction = task.get_user_prompt()
+        result = str(result)
+
+        content = MemoryContent(
+            content=f"Instruction: {instruction}\nResponse: {result}",
+            mime_type=MemoryMimeType.TEXT,
+        )
+
+        name = self.agent_name or "Agent"
+        if isinstance(self.memory, list):
+            await self.memory[-1].add(content, source_agent=name)
+        else:
+            await self.memory.add(content, source_agent=name)
+
+    def add_to_context_sync(self, task: Task, result: Any):
+        # Implement adding the result to the context of the Autogen task
+
+        # This is tricky and should be customized based on the use case
+        # We set the default behavior to add the instruction
+        #  result to the model context
+
+        instruction = task.get_user_prompt()
+        result = str(result)
+
+        content = MemoryContent(
+            content=f"Instruction: {instruction}\nResponse: {result}",
+            mime_type=MemoryMimeType.TEXT,
+        )
+
+        name = self.agent_name or "Agent"
+        if isinstance(self.memory, list):
+            self.memory[-1].add_sync(content, source_agent=name)
+        else:
+            self.memory.add_sync(content, source_agent=name)
+
+
+class AutoGenBackend(AgentBackend):
     """
-    An AutoGen agent pool that creates AutoGen agents.
+    An AutoGen agent factory backend that creates AutoGen agents.
     Setup with a model client, backend, and model to spawn agents.
 
     Args:
@@ -714,12 +766,21 @@ class AutoGenPool(AgentPool):
         self,
         model_client: Optional[Union[AsyncOpenAI, ChatCompletionClient]] = None,
         model: Optional[str] = None,
-        backend: Optional[str] = "openai",
+        backend: str = "openai",
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         model_kwargs: Optional[dict] = None,
+        **kwargs,
     ):
-        super().__init__()
+        super().__init__(
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
+            model_kwargs=model_kwargs,
+            reasoning_effort=None,
+            backend=backend,
+            **kwargs,
+        )
         self.model_client = model_client
 
         if self.model_client is None:
@@ -744,9 +805,10 @@ class AutoGenPool(AgentPool):
 
     def create_agent(
         self,
-        task: Task,
+        task: Optional[Task],
         max_retries: int = 3,
         agent_name: Optional[str] = None,
+        memory: Optional[Memory] = None,
         **kwargs,
     ):
         """Creates an AutoGen agent for the given task.
@@ -763,17 +825,10 @@ class AutoGenPool(AgentPool):
             self.model_client is not None
         ), "Model client must be initialized to create an agent."
 
-        AutoGenPool.AGENT_COUNT += 1
+        AutoGenBackend.AGENT_COUNT += 1
 
-        default_name = self.create_agent_name()
+        default_name = f"autogen_agent_{AutoGenBackend.AGENT_COUNT}"
         agent_name = default_name if agent_name is None else agent_name
-
-        if agent_name in self.agent_list:
-            warnings.warn(
-                f"Agent with name {agent_name} already exists. Creating another agent with the same name."
-            )
-        else:
-            self.agent_list.append(agent_name)
 
         agent = AutoGenAgent(
             task=task,
@@ -785,41 +840,11 @@ class AutoGenPool(AgentPool):
             model_kwargs=self.model_kwargs,
             **kwargs,
         )
-        self.agent_dict[agent_name] = agent
+        # Add memory
+        if memory:
+            assert isinstance(agent.memory, list)
+            memory_json = memory.to_list_of_tasks_and_results()
+            for memory_task, memory_result in memory_json:
+                agent.add_to_context_sync(memory_task, memory_result)
+
         return agent
-
-    def list_all_agents(self) -> list:
-        """Lists all agents in the pool.
-
-        Returns:
-            list: List of agent names.
-        """
-        return self.agent_list
-
-    def get_agent_by_name(self, name: str) -> AutoGenAgent:
-        """Gets an agent by name.
-
-        Args:
-            name (str): The name of the agent.
-
-        Returns:
-            AutoGenAgent: The agent with the given name.
-        """
-        assert name in self.agent_dict, f"Agent with name {name} does not exist."
-        return self.agent_dict[name]
-
-    def create_agent_name(
-        self, prefix: Optional[str] = None, suffix: Optional[str] = None
-    ):
-        model_name = self.model if self.model is not None else "default_model"
-        backend_name = self.backend if self.backend is not None else "default_backend"
-
-        default_name = f"[{backend_name}:{model_name}]_{AutoGenPool.AGENT_COUNT}"
-        default_name = re.sub(r"[^a-zA-Z0-9_]", "_", default_name)
-
-        if prefix:
-            default_name = f"{prefix}{default_name}"
-        if suffix:
-            default_name = f"{default_name}{suffix}"
-
-        return default_name
