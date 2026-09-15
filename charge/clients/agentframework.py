@@ -34,6 +34,7 @@ from charge.clients.agent import (
     AgentBackend,
     Agent,
     AgentCallbackType,
+    StreamingReasoningCallback,
 )
 from charge.clients.agentframework_utils import (
     POSSIBLE_CONNECTION_ERRORS,
@@ -400,36 +401,56 @@ class AgentFrameworkAgent(Agent):
                 # Run agent (Agent Framework returns AgentResponse)
                 stream = await agent.run(user_prompt, session=session, stream=True)
                 tool_call_names: dict[str, str] = {}
+                reasoning_chunks: list[str] = []
+                latest_response_usage: dict[str, int] = {}
+                streaming_reasoning_callback = (
+                    self.callback
+                    if isinstance(self.callback, StreamingReasoningCallback)
+                    else None
+                )
+
+                async def flush_reasoning() -> None:
+                    if not reasoning_chunks:
+                        return
+
+                    reasoning_text = "".join(reasoning_chunks)
+                    reasoning_chunks.clear()
+                    if self.callback is None:
+                        return
+                    if streaming_reasoning_callback is not None:
+                        await maybe_await_async(
+                            streaming_reasoning_callback.on_reasoning_complete,
+                            reasoning_text,
+                            source=self.agent_key,
+                        )
+                    else:
+                        # Preserve the original callback API for consumers that do
+                        # not implement streaming reasoning callbacks.
+                        await maybe_await_async(
+                            self.callback.on_reasoning_update,
+                            reasoning_text,
+                            source=self.agent_key,
+                        )
+
                 async for update in stream:
                     if not update.contents:
                         continue
 
-                    # Check for reasoning summary events (handle both old and new API formats)
-                    if (
-                        update.contents[0].raw_representation
-                        and update.contents[0].raw_representation.type
-                    ):
-                        raw_type = update.contents[0].raw_representation.type
-                        # Only capture .done events, not .delta events
-                        if (
-                            "reasoning_summary" in raw_type
-                            or "thinking_summary" in raw_type
-                        ) and raw_type.endswith(".done"):
-                            # Reasoning summary - use callback to transmit back
-                            if self.callback is not None and update.contents[0].text:
-                                await self.callback.on_reasoning_update(
-                                    update.contents[0].text,
-                                    source=self.agent_key,
-                                )
-                                logger.debug(
-                                    f"Captured reasoning summary from event: {raw_type}"
-                                )
-
                     for content in update.contents:
                         content_type = content.type
-                        # if "delta" in content.raw_representation.type:
-                        #     continue
-                        if content_type == "function_call":
+                        if content_type != "text_reasoning":
+                            await flush_reasoning()
+
+                        if content_type == "text_reasoning":
+                            if content.text:
+                                reasoning_chunks.append(content.text)
+                                if streaming_reasoning_callback is not None:
+                                    await maybe_await_async(
+                                        streaming_reasoning_callback.on_reasoning_delta,
+                                        content.text,
+                                        source=self.agent_key,
+                                    )
+                        elif content_type == "function_call":
                             call_id = content.call_id
                             tool_name = content.name
                             if call_id and tool_name:
@@ -478,10 +499,26 @@ class AgentFrameworkAgent(Agent):
                                     source=self.agent_key,
                                     call_id=call_id,
                                 )
+                        elif content_type == "usage" and content.usage_details:
+                            # Agent Framework aggregates usage across all model
+                            # round-trips in a tool loop. Retain the latest event
+                            # separately because it represents one context window.
+                            latest_response_usage = _usage_details_to_dict(
+                                content.usage_details
+                            )
+                await flush_reasoning()
                 result = await stream.get_final_response()
                 self._last_usage = _usage_details_to_dict(
                     getattr(result, "usage_details", None)
                 )
+                for source_key, target_key in (
+                    ("inputTokens", "contextInputTokens"),
+                    ("outputTokens", "contextOutputTokens"),
+                    ("reasoningTokens", "contextReasoningTokens"),
+                    ("totalTokens", "contextTotalTokens"),
+                ):
+                    if source_key in latest_response_usage:
+                        self._last_usage[target_key] = latest_response_usage[source_key]
 
                 # Extract content from result
                 proposed_content = ""

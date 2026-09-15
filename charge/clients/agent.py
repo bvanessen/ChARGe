@@ -4,7 +4,7 @@ from abc import abstractmethod
 from dataclasses import dataclass
 import json
 import warnings
-from typing import Any, Literal, Optional, Protocol, TypeAlias
+from typing import Any, Literal, Optional, Protocol, TypeAlias, runtime_checkable
 
 DEFAULT_BACKEND = "agentframework"
 """
@@ -41,6 +41,25 @@ class AgentCallback(Protocol):
         is_error: bool = False,
         source: Optional[str] = None,
         call_id: Optional[str] = None,
+    ) -> None: ...
+
+
+@runtime_checkable
+class StreamingReasoningCallback(Protocol):
+    """Optional callback extension for streamed reasoning content."""
+
+    async def on_reasoning_delta(
+        self,
+        text: str,
+        *,
+        source: Optional[str] = None,
+    ) -> None: ...
+
+    async def on_reasoning_complete(
+        self,
+        text: str,
+        *,
+        source: Optional[str] = None,
     ) -> None: ...
 
 
@@ -237,9 +256,7 @@ class AgentRuntimeConfig:
     model: Optional[str] = None
 
     @classmethod
-    def from_agent(
-        cls, *, agent: Agent, backend: AgentBackend
-    ) -> "AgentRuntimeConfig":
+    def from_agent(cls, *, agent: Agent, backend: AgentBackend) -> "AgentRuntimeConfig":
         model_info = agent.get_model_info()
         backend_name = (
             model_info.get("backend") if isinstance(model_info, dict) else None
