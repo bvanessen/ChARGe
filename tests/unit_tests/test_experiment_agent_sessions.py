@@ -120,22 +120,71 @@ def test_experiment_saves_and_rehydrates_raw_agent_sessions():
     assert "metadata" not in restored_state["agentSessions"]["molecule:node_1"]
 
 
-def test_experiment_load_state_rejects_backend_mismatch():
+def _agent_session_record(backend_name: str) -> dict:
+    return {
+        "runtimeConfig": {
+            "backend": backend_name,
+            "model": "dummy-model",
+        },
+        "memory": '{"messages":[{"role":"user"}]}',
+        "modelInfo": {"backend": backend_name, "model": "dummy-model"},
+        "task": Task(system_prompt="System", user_prompt="Hello").to_json(),
+    }
+
+
+def test_experiment_load_state_skips_bad_record_and_restores_the_rest():
+    # A record that fails to restore (here: mismatched backend) must not
+    # abort restoring the other agents, and must survive save_state()
+    # verbatim rather than being silently dropped from the next save.
     backend = DummyBackend()
+    bad_record = _agent_session_record("other")
     state = {
         "items": [],
         "agentSessions": {
-            "molecule:node_1": {
-                "runtimeConfig": {
-                    "backend": "other",
-                    "model": "dummy-model",
-                },
-                "memory": "",
-                "modelInfo": {"backend": "other", "model": "dummy-model"},
-                "task": Task(system_prompt="System", user_prompt="Hello").to_json(),
-            }
+            "molecule:node_1": _agent_session_record("dummy"),
+            "molecule:node_2": bad_record,
         },
     }
 
-    with pytest.raises(RuntimeError, match="mismatched backend"):
-        Experiment(task=None, backend=backend).load_state(state)
+    experiment = Experiment(task=None, backend=backend)
+    with pytest.warns(RuntimeWarning, match="molecule:node_2"):
+        experiment.load_state(state)
+
+    assert set(experiment.agent_registry) == {"molecule:node_1"}
+    restored_agent = experiment.agent_registry["molecule:node_1"].agent
+    assert restored_agent.loaded_memory == '{"messages":[{"role":"user"}]}'
+
+    saved = experiment.save_state()
+    assert saved["agentSessions"]["molecule:node_2"] == bad_record
+    assert "molecule:node_1" in saved["agentSessions"]
+
+
+def test_experiment_load_state_without_backend_keeps_all_records():
+    state = {
+        "items": [],
+        "agentSessions": {"molecule:node_1": _agent_session_record("dummy")},
+    }
+
+    experiment = Experiment(task=None, backend=None)
+    with pytest.warns(RuntimeWarning, match="molecule:node_1"):
+        experiment.load_state(state)
+
+    assert experiment.agent_registry == {}
+    saved = experiment.save_state()
+    assert saved["agentSessions"]["molecule:node_1"] == state["agentSessions"][
+        "molecule:node_1"
+    ]
+
+
+def test_experiment_reset_clears_unrestored_records():
+    state = {
+        "items": [],
+        "agentSessions": {"molecule:node_1": _agent_session_record("other")},
+    }
+
+    experiment = Experiment(task=None, backend=DummyBackend())
+    with pytest.warns(RuntimeWarning):
+        experiment.load_state(state)
+    experiment.reset()
+
+    assert "agentSessions" not in experiment.save_state()

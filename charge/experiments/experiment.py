@@ -14,6 +14,7 @@ from charge.experiments.memory import Memory, ListMemory
 from charge._utils import maybe_await_async
 import asyncio
 import json
+import warnings
 
 
 @dataclass
@@ -41,6 +42,10 @@ class Experiment:
         # never shared across sessions.
         self.backend = backend
         self.agent_registry: dict[str, AgentRegistryEntry] = {}
+        # Saved agent-session records that failed to restore in load_state().
+        # Kept verbatim so save_state() round-trips them instead of silently
+        # dropping the saved session (e.g. a chat history) from the next save.
+        self._unrestored_agent_sessions: dict[str, dict[str, Any]] = {}
         self.args = args
         self.kwargs = kwargs
 
@@ -103,9 +108,10 @@ class Experiment:
         self.memory.add_to_context(task, result)
 
     def save_state(self):
-        # Save the state of the experiment
+        # Save the state of the experiment. Records that could not be
+        # restored are carried over as-is; live registry entries win.
         state = self.memory.to_json()
-        agent_sessions = {}
+        agent_sessions = dict(self._unrestored_agent_sessions)
         for agent_key, registry_item in self.agent_registry.items():
             agent_sessions[agent_key] = serialize_agent_session(
                 registry_item.agent, registry_item.runtime_config
@@ -123,13 +129,32 @@ class Experiment:
         agent_sessions = state.get("agentSessions", {}) or {}
         if not isinstance(agent_sessions, dict):
             return
+        self._unrestored_agent_sessions = {}
         for raw_agent_key, record in agent_sessions.items():
             if not isinstance(record, dict):
                 continue
             agent_key = str(raw_agent_key)
-            agent, runtime_config = restore_agent_session(
-                agent_key, record, memory=self.memory, backend=self._require_backend()
-            )
+            try:
+                agent, runtime_config = restore_agent_session(
+                    agent_key,
+                    record,
+                    memory=self.memory,
+                    backend=self._require_backend(),
+                )
+            except Exception as exc:
+                # One bad record must not abort restoring the remaining
+                # agents (previously this lost every agent session, e.g.
+                # when one saved backend no longer matched the configured
+                # one). Keep the record for the next save_state().
+                self._unrestored_agent_sessions[agent_key] = record
+                warnings.warn(
+                    f"Failed to restore agent session for {agent_key!r}; "
+                    "skipping it and continuing with the remaining agents. "
+                    f"Original error: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                continue
             self.agent_registry[agent_key] = AgentRegistryEntry(
                 agent=agent,
                 runtime_config=runtime_config,
@@ -208,3 +233,4 @@ class Experiment:
         self.memory = ListMemory()
         self.tasks = []
         self.agent_registry = {}
+        self._unrestored_agent_sessions = {}
